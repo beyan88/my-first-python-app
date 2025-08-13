@@ -1,5 +1,6 @@
 Flask
 requests
 beautifulsoup4
+Flask-SocketIO
 gunicorn
-tqdm
+eventlet  # WebSocketの動作に必要なライブラリ
