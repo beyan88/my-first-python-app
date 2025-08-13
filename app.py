@@ -1,12 +1,12 @@
-from flask import Flask, request, render_template_string, send_file
+import csv
+import io
 import re
 from time import sleep
-import csv
+
 import requests
 from bs4 import BeautifulSoup
+from flask import Flask, send_file
 from tqdm import tqdm
-import os
-import io
 
 app = Flask(__name__)
 
