@@ -3,4 +3,4 @@ requests
 beautifulsoup4
 Flask-SocketIO
 gunicorn
-eventlet  # WebSocketの動作に必要なライブラリ
+eventlet

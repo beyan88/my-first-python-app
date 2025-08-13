@@ -1,3 +1,7 @@
+import eventlet
+
+eventlet.monkey_patch()
+
 from flask import Flask, request, render_template_string, send_file
 from flask_socketio import SocketIO, emit
 import re
@@ -104,7 +108,8 @@ def index():
 def background_scraper():
     try:
         base_url = 'https://www.buyma.com/buyer/5824366'
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
 
         # 最終ページ番号の取得
         socketio.emit('progress', {'current': 0, 'total': 100, 'message': '最終ページ番号を取得中...'})
