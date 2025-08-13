@@ -178,7 +178,7 @@ def get_last_page(url, headers):
     """
     指定されたURLから最終ページ番号を取得する。
     """
-    res = requests.get(url, headers=headers, timeout=20)
+    res = requests.get(url, headers=headers, timeout=30)
     res.encoding = res.apparent_encoding
     soup = BeautifulSoup(res.text, 'html.parser')
     try:
@@ -194,7 +194,7 @@ def scrape_item_list(base_url, last_page, headers):
     """
     item_data = []
     page_url = f'{base_url}/item_{last_page}.html'
-    res = requests.get(page_url, headers=headers, timeout=20)
+    res = requests.get(page_url, headers=headers, timeout=30)
     res.encoding = res.apparent_encoding
     soup = BeautifulSoup(res.text, 'html.parser')
     sleep(3)
@@ -213,7 +213,7 @@ def scrape_item_details(item_data, headers):
     """
     all_items = []
     for item in item_data:
-        res = requests.get(item['itemUrl'], headers=headers, timeout=20)
+        res = requests.get(item['itemUrl'], headers=headers, timeout=30)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
 
