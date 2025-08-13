@@ -1,137 +1,246 @@
-import eventlet
-
-eventlet.monkey_patch()
-
-from flask import Flask, request, render_template_string, send_file
-from flask_socketio import SocketIO, emit
+from flask import Flask, request, render_template_string, jsonify, send_file
 import re
 from time import sleep
 import csv
 import requests
 from bs4 import BeautifulSoup
+import threading
 import io
+import json
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app)
+
+# スクレイピングの進捗状況を保持するグローバル変数
+# スレッド間で共有するため、threading.Lock で保護する
+scraping_status = {
+    'status': 'idle',  # 'idle', 'in_progress', 'finished'
+    'total_items': 0,
+    'scraped_items': 0,
+    'total_pages': 0,
+    'scraped_pages': 0,
+    'csv_data': None,
+}
+status_lock = threading.Lock()
+
+# フロントエンドのHTMLテンプレート
+# プログレスバーと進捗メッセージを表示
+TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BUYMA スクレイピングアプリ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+    <div class="bg-white p-8 rounded-2xl shadow-xl max-w-lg w-full">
+        <h1 class="text-3xl font-bold text-center mb-6 text-gray-800">BUYMA スクレイピングアプリ</h1>
+        <div id="controls" class="flex justify-center">
+            <button id="start-btn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition-transform transform hover:scale-105">
+                スクレイピング開始
+            </button>
+        </div>
+
+        <div id="progress-container" class="mt-8 hidden">
+            <div class="flex justify-between items-center mb-2">
+                <span class="text-sm font-semibold text-gray-700">ページ進捗:</span>
+                <span id="page-progress-text" class="text-sm font-semibold text-gray-700">0 / 0</span>
+            </div>
+            <div class="w-full bg-gray-200 rounded-full h-4">
+                <div id="page-progress-bar" class="bg-blue-500 h-4 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+
+            <div class="flex justify-between items-center mt-4 mb-2">
+                <span class="text-sm font-semibold text-gray-700">商品進捗:</span>
+                <span id="item-progress-text" class="text-sm font-semibold text-gray-700">0 / 0</span>
+            </div>
+            <div class="w-full bg-gray-200 rounded-full h-4">
+                <div id="item-progress-bar" class="bg-green-500 h-4 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+
+            <div id="status-message" class="mt-4 text-center text-gray-600 italic">準備完了</div>
+        </div>
+
+        <div id="download-container" class="flex justify-center mt-8 hidden">
+            <a id="download-link" href="/download" class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition-transform transform hover:scale-105">
+                CSVダウンロード
+            </a>
+        </div>
+    </div>
+
+    <script>
+        const startBtn = document.getElementById('start-btn');
+        const progressContainer = document.getElementById('progress-container');
+        const pageProgressBar = document.getElementById('page-progress-bar');
+        const pageProgressText = document.getElementById('page-progress-text');
+        const itemProgressBar = document.getElementById('item-progress-bar');
+        const itemProgressText = document.getElementById('item-progress-text');
+        const statusMessage = document.getElementById('status-message');
+        const downloadContainer = document.getElementById('download-container');
+        let progressInterval;
+
+        startBtn.addEventListener('click', async () => {
+            // ボタンを無効化
+            startBtn.disabled = true;
+            startBtn.classList.add('bg-gray-400');
+            startBtn.classList.remove('bg-blue-600', 'hover:bg-blue-700');
+            statusMessage.textContent = 'スクレイピングを開始します...';
+
+            // 進捗コンテナを表示
+            progressContainer.classList.remove('hidden');
+            downloadContainer.classList.add('hidden');
+            pageProgressBar.style.width = '0%';
+            pageProgressText.textContent = '0 / 0';
+            itemProgressBar.style.width = '0%';
+            itemProgressText.textContent = '0 / 0';
+
+            // スクレイピング開始リクエストを送信
+            try {
+                const response = await fetch('/scrape', { method: 'POST' });
+                const result = await response.json();
+                statusMessage.textContent = result.message;
+
+                // 進捗更新のために定期的にサーバーをポーリング
+                progressInterval = setInterval(updateProgress, 1000);
+            } catch (error) {
+                statusMessage.textContent = 'エラーが発生しました: ' + error.message;
+            }
+        });
+
+        async function updateProgress() {
+            try {
+                const response = await fetch('/progress');
+                const status = await response.json();
+
+                // ページ進捗の更新
+                if (status.total_pages > 0) {
+                    const pageProgress = (status.scraped_pages / status.total_pages) * 100;
+                    pageProgressBar.style.width = `${pageProgress}%`;
+                    pageProgressText.textContent = `${status.scraped_pages} / ${status.total_pages}`;
+                }
+
+                // 商品進捗の更新
+                if (status.total_items > 0) {
+                    const itemProgress = (status.scraped_items / status.total_items) * 100;
+                    itemProgressBar.style.width = `${itemProgress}%`;
+                    itemProgressText.textContent = `${status.scraped_items} / ${status.total_items}`;
+                }
+
+                if (status.status === 'in_progress') {
+                    if (status.scraped_pages < status.total_pages) {
+                         statusMessage.textContent = `商品リストをスクレイピング中 (${status.scraped_pages}/${status.total_pages}ページ)...`;
+                    } else {
+                         statusMessage.textContent = `商品詳細をスクレイピング中 (${status.scraped_items}/${status.total_items})...`;
+                    }
+                } else if (status.status === 'finished') {
+                    clearInterval(progressInterval);
+                    statusMessage.textContent = 'スクレイピングが完了しました！';
+                    downloadContainer.classList.remove('hidden');
+                    // ボタンを再有効化
+                    startBtn.disabled = false;
+                    startBtn.classList.remove('bg-gray-400');
+                    startBtn.classList.add('bg-blue-600', 'hover:bg-blue-700');
+                }
+            } catch (error) {
+                clearInterval(progressInterval);
+                statusMessage.textContent = '進捗の取得中にエラーが発生しました。';
+            }
+        }
+    </script>
+</body>
+</html>
+"""
 
 
-# トップページ
+# トップページを表示
 @app.route("/")
 def index():
     """
     スクレイピングを開始するためのトップページを表示します。
     """
-    return """
-    <!DOCTYPE html>
-    <html lang="ja">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>BUYMA スクレイピングアプリ</title>
-        <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; color: #333; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; text-align: center; }
-            .container { background-color: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1); max-width: 600px; width: 100%; }
-            h1 { color: #2c3e50; margin-bottom: 20px; }
-            p { color: #7f8c8d; line-height: 1.6; }
-            button { background-color: #3498db; color: #ffffff; border: none; padding: 15px 30px; font-size: 16px; font-weight: bold; border-radius: 8px; cursor: pointer; transition: background-color 0.3s, transform 0.2s; box-shadow: 0 4px 10px rgba(52, 152, 219, 0.3); }
-            button:hover { background-color: #2980b9; transform: translateY(-2px); }
-            .progress-container { width: 100%; background-color: #e9ecef; border-radius: 8px; overflow: hidden; margin-top: 20px; display: none; }
-            .progress-bar { width: 0%; height: 30px; background-color: #2ecc71; text-align: center; line-height: 30px; color: white; transition: width 0.4s ease; }
-            #status { margin-top: 10px; font-weight: bold; color: #555; }
-            .download-link { margin-top: 20px; display: none; }
-            .download-link a { color: #3498db; text-decoration: none; font-weight: bold; font-size: 18px; }
-            .download-link a:hover { text-decoration: underline; }
-            .error-message { color: #e74c3c; font-weight: bold; margin-top: 20px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>BUYMA スクレイピングアプリ</h1>
-            <p>以下のボタンをクリックしてスクレイピングを開始します。</p>
-            <button id="startButton">スクレイピング開始</button>
-            <div class="progress-container" id="progressContainer">
-                <div class="progress-bar" id="progressBar">0%</div>
-            </div>
-            <div id="status"></div>
-            <div class="download-link" id="downloadLink"></div>
-            <div id="errorMessage" class="error-message"></div>
-        </div>
-        <script>
-            document.addEventListener('DOMContentLoaded', () => {
-                const socket = io();
-                const startButton = document.getElementById('startButton');
-                const progressContainer = document.getElementById('progressContainer');
-                const progressBar = document.getElementById('progressBar');
-                const statusDiv = document.getElementById('status');
-                const downloadLinkDiv = document.getElementById('downloadLink');
-                const errorMessageDiv = document.getElementById('errorMessage');
+    return render_template_string(TEMPLATE)
 
-                startButton.addEventListener('click', () => {
-                    startButton.disabled = true;
-                    progressContainer.style.display = 'block';
-                    progressBar.style.width = '0%';
-                    progressBar.textContent = '0%';
-                    statusDiv.textContent = 'スクレイピングを開始します...';
-                    downloadLinkDiv.style.display = 'none';
-                    errorMessageDiv.textContent = '';
 
-                    fetch('/scrape', { method: 'POST' });
-                });
-
-                socket.on('progress', (data) => {
-                    const percentage = Math.round((data.current / data.total) * 100);
-                    progressBar.style.width = percentage + '%';
-                    progressBar.textContent = percentage + '%';
-                    statusDiv.textContent = data.message;
-                });
-
-                socket.on('complete', (data) => {
-                    statusDiv.textContent = data.message;
-                    if (data.success) {
-                        downloadLinkDiv.innerHTML = `<a href="/download-csv" download>結果をダウンロード</a>`;
-                        downloadLinkDiv.style.display = 'block';
-                    } else {
-                        errorMessageDiv.textContent = 'エラーが発生しました: ' + data.error;
-                    }
-                    startButton.disabled = false;
-                });
-            });
-        </script>
-    </body>
-    </html>
+# スクレイピングを開始するエンドポイント
+@app.route("/scrape", methods=["POST"])
+def scrape():
     """
+    スクレイピングをバックグラウンドスレッドで開始し、クライアントに進捗開始を通知します。
+    """
+    with status_lock:
+        if scraping_status['status'] == 'in_progress':
+            return jsonify({'message': 'スクレイピングは既に進行中です。'}), 409
+
+        # ステータスをリセット
+        scraping_status['status'] = 'in_progress'
+        scraping_status['total_items'] = 0
+        scraping_status['scraped_items'] = 0
+        scraping_status['total_pages'] = 0
+        scraping_status['scraped_pages'] = 0
+        scraping_status['csv_data'] = None
+
+    # 別スレッドでスクレイピング関数を実行
+    threading.Thread(target=start_scraping).start()
+    return jsonify({'message': 'スクレイピングを開始しました。進捗を確認してください。'})
 
 
-# スクレイピングのバックグラウンドタスク
-def background_scraper():
+# 進捗状況を取得するエンドポイント
+@app.route("/progress")
+def get_progress():
+    """
+    現在のスクレイピングの進捗状況を返します。
+    """
+    with status_lock:
+        return jsonify(scraping_status)
+
+
+# CSVファイルをダウンロードするエンドポイント
+@app.route("/download")
+def download_csv():
+    """
+    完了したスクレイピング結果のCSVファイルを返します。
+    """
+    with status_lock:
+        if scraping_status['status'] != 'finished' or not scraping_status['csv_data']:
+            return "スクレイピングが完了していません。", 404
+
+        csv_buffer = io.BytesIO(scraping_status['csv_data'].encode('utf-8-sig'))
+
+        return send_file(
+            csv_buffer,
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name='ChasePrice.csv'
+        )
+
+
+def start_scraping():
+    """
+    実際のスクレイピング処理。
+    進捗をグローバル変数に定期的に更新します。
+    """
     try:
         base_url = 'https://www.buyma.com/buyer/5824366'
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0"}
 
         # 最終ページ番号の取得
-        socketio.emit('progress', {'current': 0, 'total': 100, 'message': '最終ページ番号を取得中...'})
-        last_page = get_last_page(f'{base_url}/item_1.html', headers)
-        last_page = 1  # 1ページに限定
+        last_page = get_last_page(base_url, headers)
+        with status_lock:
+            scraping_status['total_pages'] = last_page
 
         # 商品リストのスクレイピング
-        item_list = []
-        for i in range(1, last_page + 1):
-            socketio.emit('progress', {'current': 10 + i, 'total': 100,
-                                       'message': f'商品リスト ({i}/{last_page}ページ) を取得中...'})
-            item_list.extend(scrape_item_list(base_url, last_page, headers))
+        item_list = scrape_item_list(base_url, last_page, headers)
+
+        # スクリーピングする商品総数を設定
+        with status_lock:
+            scraping_status['total_items'] = len(item_list)
 
         # 商品詳細のスクレイピング
-        final_data = []
-        for i, item in enumerate(item_list):
-            socketio.emit('progress',
-                          {'current': 20 + int(70 * (i / len(item_list))) if len(item_list) > 0 else 90, 'total': 100,
-                           'message': f'商品詳細 ({i + 1}/{len(item_list)}個) を取得中...'})
-            final_data.extend(scrape_item_details([item], headers))
-
-        socketio.emit('progress', {'current': 100, 'total': 100, 'message': 'スクレイピングが完了しました。'})
+        final_data = scrape_item_details(item_list, headers)
 
         # CSVデータをメモリ上で生成
         csv_buffer = io.StringIO()
@@ -141,54 +250,31 @@ def background_scraper():
             writer.writeheader()
             writer.writerows(final_data)
 
-        csv_buffer.seek(0)
-
-        # セッションにCSVデータを保存
-        app.config['CSV_DATA'] = csv_buffer.getvalue().encode('utf-8-sig')
-
-        socketio.emit('complete', {'success': True, 'message': '完了しました。ダウンロードしてください。'})
+        # CSVデータをグローバル変数に保存し、ステータスを更新
+        with status_lock:
+            scraping_status['csv_data'] = csv_buffer.getvalue()
+            scraping_status['status'] = 'finished'
 
     except Exception as e:
-        socketio.emit('complete',
-                      {'success': False, 'error': str(e), 'message': 'スクレイピング中にエラーが発生しました。'})
-
-
-# スクレイピング開始のエンドポイント
-@app.route("/scrape", methods=["POST"])
-def start_scrape():
-    """
-    非同期でスクレイピングを開始します。
-    """
-    socketio.start_background_task(background_scraper)
-    return 'Scraping started'
-
-
-# CSVダウンロードエンドポイント
-@app.route("/download-csv")
-def download_csv():
-    """
-    生成されたCSVファイルをダウンロードします。
-    """
-    if 'CSV_DATA' in app.config:
-        return send_file(
-            io.BytesIO(app.config['CSV_DATA']),
-            mimetype='text/csv',
-            as_attachment=True,
-            download_name='ChasePrice.csv'
-        )
-    return "No CSV file found.", 404
+        print(f"スクレイピング中にエラーが発生しました: {e}")
+        with status_lock:
+            scraping_status['status'] = 'error'
 
 
 def get_last_page(url, headers):
     """
     指定されたURLから最終ページ番号を取得する。
     """
-    res = requests.get(url, headers=headers, timeout=30)
-    res.encoding = res.apparent_encoding
-    soup = BeautifulSoup(res.text, 'html.parser')
     try:
-        lastpage = int(soup.select('a[class="box"]')[-1]['href'].split('_')[1].split('.')[0])
-        return lastpage
+        res = requests.get(url, headers=headers, timeout=20)
+        res.encoding = res.apparent_encoding
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        # 最終ページ番号のセレクターを修正
+        last_page_element = soup.select('a[class="box"]')[-1]
+        if last_page_element and 'item' in last_page_element['href']:
+            return int(last_page_element['href'].split('_')[1].split('.')[0])
+        return 1
     except (IndexError, ValueError):
         return 1
 
@@ -198,27 +284,34 @@ def scrape_item_list(base_url, last_page, headers):
     各ページから商品URLと価格をスクレイピングする。
     """
     item_data = []
-    page_url = f'{base_url}/item_{last_page}.html'
-    res = requests.get(page_url, headers=headers, timeout=30)
-    res.encoding = res.apparent_encoding
-    soup = BeautifulSoup(res.text, 'html.parser')
-    sleep(3)
+    for i in range(1, last_page + 1):
+        page_url = f'{base_url}/item_{i}.html'
+        res = requests.get(page_url, headers=headers, timeout=20)
+        res.encoding = res.apparent_encoding
+        soup = BeautifulSoup(res.text, 'html.parser')
+        sleep(3)
 
-    for h, j in zip(soup.select('img[class="itemimg"]'),
-                    soup.select('p[class="buyeritem_price"]')):
-        item_url = 'https://www.buyma.com/item/' + h.get('id').split('_')[1]
-        price = re.sub(r'[^0-9.]', '', j.text)
-        item_data.append({'itemUrl': item_url, 'price': price})
+        for h, j in zip(soup.select('img[class="itemimg"]'),
+                        soup.select('p[class="buyeritem_price"]')):
+            item_url = 'https://www.buyma.com/item/' + h.get('id').split('_')[1]
+            price = re.sub(r'[^0-9.]', '', j.text)
+            item_data.append({'itemUrl': item_url, 'price': price})
+
+        # ページ巡回の進捗を更新
+        with status_lock:
+            scraping_status['scraped_pages'] += 1
+
     return item_data
 
 
 def scrape_item_details(item_data, headers):
     """
     商品の詳細ページからskuと商品名を取得し、データを統合する。
+    進捗をグローバル変数に更新します。
     """
     all_items = []
     for item in item_data:
-        res = requests.get(item['itemUrl'], headers=headers, timeout=30)
+        res = requests.get(item['itemUrl'], headers=headers, timeout=20)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
 
@@ -234,11 +327,14 @@ def scrape_item_details(item_data, headers):
             })
         except AttributeError:
             continue
+
+        # 進捗を1つ進める
+        with status_lock:
+            scraping_status['scraped_items'] += 1
+
         sleep(3)
     return all_items
 
 
 if __name__ == "__main__":
-    # このアプリをローカルで実行します。
-    # ターミナルに表示されるURL (例: http://127.0.0.1:5000/) にアクセスしてください。
-    socketio.run(app, debug=True, allow_unsafe_werkzeug=True, host='0.0.0.0')
+    app.run(debug=True, port=8080)
